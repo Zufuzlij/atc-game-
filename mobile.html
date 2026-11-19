@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0e0b">
+<title>Авиадиспетчер — мобильная версия</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0b0e0b;
+    position: fixed;
+    touch-action: none;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas {
+    display: block;
+    position: fixed;
+    left: 0;
+    top: 0;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+'use strict';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// Виртуальное разрешение под iPhone Pro Max (440x956 точек, DPR 3 = 1320x2868 px)
+const VW = 440;
+const VH = 956;
+const HUD_H = 48;
+const RH = 560;                 // высота радара
+const PANEL_Y = HUD_H + RH;     // 608
+const PANEL_H = VH - PANEL_Y;   // 348
+
+let dpr = 1, scale = 1, ox = 0, oy = 0, cw = VW, ch = VH;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  cw = window.innerWidth;
+  ch = window.innerHeight;
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  canvas.style.width = cw + 'px';
+  canvas.style.height = ch + 'px';
+  scale = Math.min(cw / VW, ch / VH);
+  ox = (cw - VW * scale) / 2;
+  oy = (ch - VH * scale) / 2;
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+resize();
+
+const RWY = { x1: 175, x2: 265, y: 280, hdg: 0 };
+const AIRPORT = { x: (RWY.x1 + RWY.x2) / 2, y: RWY.y };
+
+const TURN_RATE = 60;
+const CLIMB_RATE = 2200;
+const LAND_DESCENT = 1200;
+const ACCEL = 20;
+const PX_PER_KT = 0.35;
+const MIN_SEP = 22;
+const WARN_SEP = 42;
+const VERT_SEP = 1000;
+
+const PREFIXES = ['AFL', 'S7', 'UTA', 'VKO', 'SVO', 'NORD', 'AERO', 'URAL', 'POB', 'GOS'];
+
+const G = {
+  state: 'menu',
+  planes: [],
+  effects: [],
+  toasts: [],
+  selected: null,
+  score: 0,
+  best: parseInt(localStorage.getItem('atc_best_m') || '0', 10),
+  landed: 0,
+  missed: 0,
+  lives: 3,
+  streak: 0,
+  time: 0,
+  level: 1,
+  spawnT: 3,
+  overReason: '',
+  conflicts: new Set(),
+  lastWarnBeep: 0,
+  nextId: 1,
+};
+
+let muted = false;
+let actx = null;
+let mouse = { x: -1, y: -1 };
+
+function beep(freq, dur, type, vol) {
+  if (muted) return;
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = type || 'square';
+    o.frequency.value = freq;
+    g.gain.value = vol || 0.04;
+    o.connect(g);
+    g.connect(actx.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.stop(actx.currentTime + dur);
+  } catch (e) { /* звук недоступен */ }
+}
+
+function chime() { beep(660, 0.12, 'sine', 0.06); setTimeout(() => beep(880, 0.2, 'sine', 0.06), 120); }
+
+function norm(a) { a %= 360; return a < 0 ? a + 360 : a; }
+function angDiff(a, b) { let d = (a - b) % 360; if (d > 180) d -= 360; if (d < -180) d += 360; return d; }
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function angTo(p, t) { return norm(Math.atan2(t.y - p.y, t.x - p.x) * 180 / Math.PI); }
+
+function toast(text, cls) {
+  G.toasts.push({ text, cls: cls || 'info', t0: performance.now() });
+  if (G.toasts.length > 4) G.toasts.shift();
+}
+
+function reset() {
+  G.planes = [];
+  G.effects = [];
+  G.toasts = [];
+  G.selected = null;
+  G.score = 0;
+  G.landed = 0;
+  G.missed = 0;
+  G.lives = 3;
+  G.streak = 0;
+  G.time = 0;
+  G.level = 1;
+  G.spawnT = 2.5;
+  G.overReason = '';
+  G.conflicts = new Set();
+  G.nextId = 1;
+}
+
+function start() {
+  reset();
+  G.state = 'playing';
+  toast('Смена началась. Удачи, диспетчер!', 'ok');
+  beep(520, 0.15, 'sine', 0.05);
+}
+
+function gameOver(reason) {
+  G.state = 'over';
+  G.overReason = reason;
+  if (G.score > G.best) {
+    G.best = G.score;
+    localStorage.setItem('atc_best_m', String(G.best));
+  }
+  beep(90, 0.9, 'sawtooth', 0.12);
+  toast('Конец игры: ' + reason, 'bad');
+}
+
+function spawnPlane() {
+  const edge = Math.floor(Math.random() * 4);
+  let x, y;
+  if (edge === 0) { x = -25; y = 30 + Math.random() * (RH - 60); }
+  else if (edge === 1) { x = VW + 25; y = 30 + Math.random() * (RH - 60); }
+  else if (edge === 2) { x = 30 + Math.random() * (VW - 60); y = -25; }
+  else { x = 30 + Math.random() * (VW - 60); y = RH + 25; }
+
+  const hdg = norm(angTo({ x, y }, AIRPORT) + (Math.random() * 40 - 20));
+  const alt = Math.round((6000 + Math.random() * 14000) / 1000) * 1000;
+  const spd = 160 + Math.floor(Math.random() * 80);
+  const cs = PREFIXES[Math.floor(Math.random() * PREFIXES.length)] + (100 + Math.floor(Math.random() * 900));
+
+  G.planes.push({
+    id: G.nextId++,
+    cs,
+    x, y, hdg,
+    alt, targetAlt: alt,
+    spd, targetSpd: spd,
+    state: 'inbound',
+    vec: null,
+  });
+}
+
+function selectedPlane() {
+  return G.planes.find(p => p.id === G.selected) || null;
+}
+
+function cmdAlt(d) {
+  const p = selectedPlane();
+  if (!p || p.state !== 'inbound') return;
+  p.targetAlt = clamp(p.targetAlt + d, 500, 40000);
+  beep(440, 0.05, 'square', 0.03);
+}
+
+function cmdSpd(d) {
+  const p = selectedPlane();
+  if (!p || p.state !== 'inbound') return;
+  p.targetSpd = clamp(p.targetSpd + d, 120, 320);
+  beep(440, 0.05, 'square', 0.03);
+}
+
+function cmdVector(x, y) {
+  const p = selectedPlane();
+  if (!p || p.state !== 'inbound') return;
+  p.vec = { x, y };
+}
+
+function canLand(p) {
+  if (p.state !== 'inbound') return { ok: false, why: 'уже не в заходе' };
+  if (Math.abs(angDiff(p.hdg, RWY.hdg)) > 30) return { ok: false, why: 'не на курсе полосы (на восток)' };
+  if (Math.abs(p.y - RWY.y) > 30) return { ok: false, why: 'далеко от оси полосы' };
+  if (p.x > RWY.x1 + 15) return { ok: false, why: 'пролетел начало полосы' };
+  if (p.x < RWY.x1 - 420) return { ok: false, why: 'слишком далеко от полосы' };
+  if (p.alt > 3500) return { ok: false, why: 'высоко (' + p.alt + ' фт)' };
+  if (p.spd > 210) return { ok: false, why: 'быстро (' + Math.round(p.spd) + ' узл)' };
+  return { ok: true };
+}
+
+function cmdLand() {
+  const p = selectedPlane();
+  if (!p) { toast('Сначала выбери самолёт', 'bad'); return; }
+  const r = canLand(p);
+  if (!r.ok) { toast(p.cs + ': невозможно — ' + r.why, 'bad'); beep(180, 0.2, 'sawtooth', 0.05); return; }
+  p.state = 'landing';
+  p.vec = null;
+  toast(p.cs + ' допущен к посадке', 'ok');
+  chime();
+}
+
+function landSuccess(p) {
+  G.landed++;
+  G.streak++;
+  const bonus = Math.min(G.streak, 10) * 5;
+  G.score += 100 + bonus;
+  G.effects.push({ x: p.x, y: p.y, t: 0, type: 'land' });
+  toast(p.cs + ' сел. +' + (100 + bonus), 'ok');
+  chime();
+  if (G.landed % 5 === 0) {
+    G.score += 250;
+    toast('Бонус за 5 посадок: +250', 'ok');
+  }
+  removePlane(p);
+}
+
+function goAround(p) {
+  p.state = 'gone';
+  p.targetAlt = 4000;
+  p.targetSpd = 200;
+  p.vec = { x: VW + 100, y: p.y };
+  miss(p.cs + ' ушёл на второй круг');
+}
+
+function miss(text) {
+  G.missed++;
+  G.lives--;
+  G.streak = 0;
+  toast(text + ' — минус жизнь', 'bad');
+  beep(200, 0.3, 'sawtooth', 0.07);
+  if (G.lives <= 0) gameOver('Слишком много пропущенных рейсов');
+}
+
+function removePlane(p) {
+  if (G.selected === p.id) G.selected = null;
+  G.planes = G.planes.filter(q => q !== p);
+}
+
+function update(dt) {
+  if (G.state !== 'playing') return;
+
+  G.time += dt;
+  G.level = 1 + Math.floor(G.time / 30);
+
+  const interval = Math.max(2.4, 7.5 - G.level * 0.9);
+  const maxPlanes = Math.min(12, 4 + G.level * 2);
+  G.spawnT -= dt;
+  const active = G.planes.filter(p => p.state === 'inbound' || p.state === 'landing').length;
+  if (G.spawnT <= 0 && active < maxPlanes) {
+    spawnPlane();
+    G.spawnT = interval * (0.7 + Math.random() * 0.6);
+  }
+
+  for (const p of G.planes) {
+    if (p.state === 'inbound' && p.vec) {
+      const want = angTo(p, p.vec);
+      const d = angDiff(want, p.hdg);
+      const step = TURN_RATE * dt;
+      p.hdg = norm(p.hdg + clamp(d, -step, step));
+      if (Math.hypot(p.vec.x - p.x, p.vec.y - p.y) < 12) p.vec = null;
+    } else if (p.state === 'landing') {
+      const want = angTo(p, { x: RWY.x1 + 40, y: RWY.y });
+      const d = angDiff(want, p.hdg);
+      const step = 70 * dt;
+      p.hdg = norm(p.hdg + clamp(d, -step, step));
+      p.targetAlt = 0;
+      p.targetSpd = p.alt > 500 ? 150 : 120;
+    }
+
+    const vertRate = p.state === 'landing' ? LAND_DESCENT : CLIMB_RATE;
+    p.alt += clamp(p.targetAlt - p.alt, -vertRate * dt, vertRate * dt);
+    p.spd += clamp(p.targetSpd - p.spd, -ACCEL * dt, ACCEL * dt);
+
+    const rad = p.hdg * Math.PI / 180;
+    p.x += Math.cos(rad) * p.spd * PX_PER_KT * dt;
+    p.y += Math.sin(rad) * p.spd * PX_PER_KT * dt;
+
+    if (p.state === 'landing') {
+      if (p.alt <= 0) {
+        p.alt = 0;
+        if (p.x >= RWY.x1 - 15 && p.x <= RWY.x2 + 15) landSuccess(p);
+        else goAround(p);
+      } else if (p.x > RWY.x2 + 90) {
+        goAround(p);
+      }
+    }
+
+    if (p.x < -60 || p.x > VW + 60 || p.y < -60 || p.y > RH + 60) {
+      if (p.state === 'inbound') miss(p.cs + ' вышел из зоны без посадки');
+      removePlane(p);
+    }
+  }
+
+  G.conflicts.clear();
+  for (let i = 0; i < G.planes.length; i++) {
+    for (let j = i + 1; j < G.planes.length; j++) {
+      const a = G.planes[i], b = G.planes[j];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (Math.abs(a.alt - b.alt) < VERT_SEP) {
+        if (dist < MIN_SEP) {
+          gameOver('Столкновение: ' + a.cs + ' и ' + b.cs);
+          return;
+        }
+        if (dist < WARN_SEP) {
+          G.conflicts.add(a.id < b.id ? a.id + ':' + b.id : b.id + ':' + a.id);
+        }
+      }
+    }
+  }
+  if (G.conflicts.size > 0 && G.time - G.lastWarnBeep > 1.2) {
+    G.lastWarnBeep = G.time;
+    beep(240, 0.12, 'sawtooth', 0.06);
+    toast('⚠ Конфликт! Разведите борта', 'bad');
+  }
+
+  for (const e of G.effects) e.t += dt;
+  G.effects = G.effects.filter(e => e.t < 1);
+}
+
+function drawGrid() {
+  ctx.strokeStyle = 'rgba(60, 255, 130, 0.10)';
+  ctx.lineWidth = 1;
+  for (let r = 80; r <= 400; r += 80) {
+    ctx.beginPath();
+    ctx.arc(AIRPORT.x, AIRPORT.y, r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(60, 255, 130, 0.06)';
+  for (let a = 0; a < 360; a += 30) {
+    const rad = a * Math.PI / 180;
+    ctx.beginPath();
+    ctx.moveTo(AIRPORT.x, AIRPORT.y);
+    ctx.lineTo(AIRPORT.x + Math.cos(rad) * 460, AIRPORT.y + Math.sin(rad) * 460);
+    ctx.stroke();
+  }
+  ctx.fillStyle = 'rgba(120, 255, 170, 0.45)';
+  ctx.font = '11px monospace';
+  ctx.fillText('N', AIRPORT.x - 3, 14);
+  ctx.fillText('S', AIRPORT.x - 3, RH - 6);
+  ctx.fillText('W', 6, AIRPORT.y - 6);
+  ctx.fillText('E', VW - 12, AIRPORT.y - 6);
+  ctx.fillStyle = 'rgba(120, 255, 170, 0.3)';
+  ctx.font = '9px monospace';
+  for (let r = 80; r <= 400; r += 80) ctx.fillText((r / 16) + 'NM', AIRPORT.x + r + 2, AIRPORT.y - 2);
+}
+
+function drawRunway() {
+  const { x1, x2, y } = RWY;
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(x1 - 6, y - 6, (x2 - x1) + 12, 12);
+  ctx.strokeStyle = '#cfcfcf';
+  ctx.lineWidth = 1.2;
+  ctx.strokeRect(x1 - 6, y - 6, (x2 - x1) + 12, 12);
+  ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+  ctx.setLineDash([6, 5]);
+  ctx.beginPath();
+  ctx.moveTo(x1, y);
+  ctx.lineTo(x2, y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#cfcfcf';
+  for (let i = 0; i < 5; i++) {
+    ctx.fillRect(x1 + 2 + i * 4, y - 4, 2, 8);
+    ctx.fillRect(x2 - 4 - i * 4, y - 4, 2, 8);
+  }
+  ctx.fillStyle = 'rgba(200,255,215,0.8)';
+  ctx.font = '10px monospace';
+  ctx.fillText('RWY 09', x1 - 6, y - 12);
+  ctx.fillText('► на восток', x2 + 8, y + 4);
+}
+
+function planeConflict(id) {
+  for (const key of G.conflicts) {
+    const parts = key.split(':');
+    if (parseInt(parts[0], 10) === id || parseInt(parts[1], 10) === id) return true;
+  }
+  return false;
+}
+
+function drawPlane(p) {
+  const isSel = G.selected === p.id;
+  const inConflict = planeConflict(p.id);
+  const blink = inConflict && Math.floor(G.time * 4) % 2 === 0;
+
+  let color = '#3aff6e';
+  if (p.state === 'landing') color = '#ffd23a';
+  if (inConflict) color = blink ? '#ff2020' : '#ff8080';
+  if (isSel) color = '#ffffff';
+
+  if (isSel && p.vec && p.state === 'inbound') {
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.vec.x, p.vec.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(p.vec.x, p.vec.y, 4, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  if (p.state === 'landing') {
+    ctx.strokeStyle = 'rgba(255,210,58,0.35)';
+    ctx.setLineDash([3, 5]);
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(RWY.x1 + 40, RWY.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(p.hdg * Math.PI / 180);
+  ctx.beginPath();
+  ctx.moveTo(9, 0);
+  ctx.lineTo(-7, -5);
+  ctx.lineTo(-3, 0);
+  ctx.lineTo(-7, 5);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
+
+  if (isSel) {
+    ctx.strokeStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 13, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.font = '9px monospace';
+  ctx.fillStyle = color;
+  const fl = Math.round(p.alt / 100);
+  ctx.fillText(p.cs, p.x + 12, p.y - 6);
+  ctx.fillText('FL' + fl + ' ' + Math.round(p.spd), p.x + 12, p.y + 4);
+}
+
+function drawEffects() {
+  for (const e of G.effects) {
+    const a = 1 - e.t;
+    ctx.strokeStyle = 'rgba(94, 255, 138, ' + a.toFixed(2) + ')';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, 6 + e.t * 30, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
+function drawToasts() {
+  const now = performance.now();
+  G.toasts = G.toasts.filter(t => now - t.t0 < 4200);
+  ctx.font = '12px monospace';
+  G.toasts.forEach((t, i) => {
+    const alpha = clamp(1 - (now - t.t0) / 4000, 0, 1);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = t.cls === 'ok' ? '#5eff8a' : t.cls === 'bad' ? '#ff6b6b' : '#8fd0ff';
+    ctx.fillText(t.text, 8, RH - 10 - (G.toasts.length - 1 - i) * 15);
+  });
+  ctx.globalAlpha = 1;
+}
+
+function fmtTime(t) {
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function drawHUD() {
+  ctx.fillStyle = '#04140a';
+  ctx.fillRect(0, 0, VW, HUD_H);
+  ctx.strokeStyle = '#1d5c33';
+  ctx.beginPath();
+  ctx.moveTo(0, HUD_H - 0.5);
+  ctx.lineTo(VW, HUD_H - 0.5);
+  ctx.stroke();
+  ctx.font = '11px monospace';
+  const row1 = [
+    ['СЧЁТ ', G.score, 8, '#5eff8a'],
+    ['СЕЛО ', G.landed, 105, '#5eff8a'],
+    ['Мимо ', G.missed, 185, '#5eff8a'],
+    ['♥ ', G.lives > 0 ? String(G.lives) : '—', 260, G.lives <= 1 ? '#ff5a5a' : '#ff8080'],
+  ];
+  const row2 = [
+    ['ВРЕМЯ ', fmtTime(G.time), 8, '#5eff8a'],
+    ['LV ', G.level, 100, '#5eff8a'],
+    ['БОРТОВ ', G.planes.length, 155, '#5eff8a'],
+    ['РЕКОРД ', G.best, 245, '#ffd23a'],
+  ];
+  for (const [label, val, x, color] of row1) {
+    ctx.fillStyle = '#6fae83';
+    ctx.fillText(label, x, 16);
+    ctx.fillStyle = color;
+    ctx.fillText(String(val), x + ctx.measureText(label).width + 2, 16);
+  }
+  for (const [label, val, x, color] of row2) {
+    ctx.fillStyle = '#6fae83';
+    ctx.fillText(label, x, 36);
+    ctx.fillStyle = color;
+    ctx.fillText(String(val), x + ctx.measureText(label).width + 2, 36);
+  }
+}
+
+function hasInboundSelection() {
+  const p = selectedPlane();
+  return !!(p && p.state === 'inbound');
+}
+
+function togglePause() {
+  if (G.state === 'playing' || G.state === 'paused') {
+    G.state = G.state === 'playing' ? 'paused' : 'playing';
+  }
+}
+
+function toggleMute() {
+  muted = !muted;
+  toast(muted ? 'Звук выключен' : 'Звук включён', 'info');
+}
+
+const BUTTON_DEFS = [
+  { label: '▲ +1000', action: () => cmdAlt(1000), enabled: hasInboundSelection },
+  { label: '▼ −1000', action: () => cmdAlt(-1000), enabled: hasInboundSelection },
+  { label: '+10 узл', action: () => cmdSpd(10), enabled: hasInboundSelection },
+  { label: '−10 узл', action: () => cmdSpd(-10), enabled: hasInboundSelection },
+  { label: 'ПОСАДКА', action: cmdLand, enabled: hasInboundSelection, accent: true },
+  { label: () => G.state === 'paused' ? '▶ ДАЛЬШЕ' : 'ПАУЗА', action: togglePause, enabled: () => G.state === 'playing' || G.state === 'paused' },
+  { label: 'ЗАНОВО', action: start, enabled: () => true },
+  { label: () => muted ? 'ЗВУК выкл' : 'ЗВУК вкл', action: toggleMute, enabled: () => true },
+];
+
+function buttonRects() {
+  const perRow = 4, gap = 8, bw = (VW - 20 - (perRow - 1) * gap) / perRow, bh = 46;
+  return BUTTON_DEFS.map((b, i) => {
+    const col = i % perRow, row = Math.floor(i / perRow);
+    return { def: b, x: 10 + col * (bw + gap), y: PANEL_Y + 44 + row * (bh + 8), w: bw, h: bh };
+  });
+}
+
+function drawPanel() {
+  ctx.fillStyle = '#04140a';
+  ctx.fillRect(0, PANEL_Y, VW, PANEL_H);
+  ctx.strokeStyle = '#1d5c33';
+  ctx.beginPath();
+  ctx.moveTo(0, PANEL_Y + 0.5);
+  ctx.lineTo(VW, PANEL_Y + 0.5);
+  ctx.stroke();
+
+  const p = selectedPlane();
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#ffe9a8';
+  if (p) {
+    ctx.fillText(p.cs + ' — ' + (p.state === 'inbound' ? 'на подходе' : p.state === 'landing' ? 'на посадке' : 'уходит'), 10, PANEL_Y + 16);
+    ctx.fillText('FL' + Math.round(p.alt / 100) + '→' + Math.round(p.targetAlt / 100) + '  ' + Math.round(p.spd) + '→' + Math.round(p.targetSpd) + ' узл', 10, PANEL_Y + 31);
+  } else {
+    ctx.fillText('Тапни по самолёту на радаре, чтобы выбрать', 10, PANEL_Y + 16);
+    ctx.fillText('Тапни по радару — вектор на точку', 10, PANEL_Y + 31);
+  }
+
+  for (const r of buttonRects()) {
+    const en = r.def.enabled();
+    const hov = en && mouse.x >= r.x && mouse.x <= r.x + r.w && mouse.y >= r.y && mouse.y <= r.y + r.h;
+    ctx.fillStyle = !en ? '#051a0d' : r.def.accent ? (hov ? '#4a3a0a' : '#2b2206') : (hov ? '#0a4423' : '#062b16');
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = r.def.accent ? '#b8860b' : '#2c7a45';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    ctx.fillStyle = !en ? '#3a5c46' : r.def.accent ? '#ffd23a' : '#7dffab';
+    ctx.font = 'bold 13px monospace';
+    const label = typeof r.def.label === 'function' ? r.def.label() : r.def.label;
+    const tw = ctx.measureText(label).width;
+    ctx.fillText(label, r.x + (r.w - tw) / 2, r.y + 29);
+  }
+
+  ctx.fillStyle = '#6fae83';
+  ctx.font = '10px monospace';
+  ctx.fillText('Цель: посадить на RWY 09 — заход с запада, курс на восток,', 10, PANEL_Y + 172);
+  ctx.fillText('высота ≤ 3500 фт, скорость ≤ 210 узл. Столкновение — конец игры.', 10, PANEL_Y + 186);
+  ctx.fillText('Пропуск борта — минус жизнь (3 жизни). Удачи!', 10, PANEL_Y + 200);
+}
+
+function centerText(lines, y0, lineH, size, color) {
+  ctx.font = size + 'px monospace';
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  lines.forEach((ln, i) => ctx.fillText(ln, VW / 2, y0 + i * lineH));
+  ctx.textAlign = 'left';
+}
+
+function drawMenu() {
+  ctx.fillStyle = 'rgba(2, 6, 2, 0.85)';
+  ctx.fillRect(0, 0, VW, RH);
+  centerText(['АВИАДИСПЕТЧЕР', 'симулятор ATC'], 130, 30, 28, '#5eff8a');
+  centerText([
+    'Сажай борта на RWY 09:',
+    'заход с запада, курс на восток,',
+    'высота ≤ 3500 фт, скорость ≤ 210 узл.',
+    '',
+    'Тапни по борту — выбрать,',
+    'тапни по радару — вектор на точку,',
+    'кнопки внизу — высота и скорость.',
+    '',
+    'Не допускай столкновений!',
+    '',
+    'ТАПНИ ПО РАДАРУ, ЧТОБЫ НАЧАТЬ',
+  ], 220, 21, 12, '#c8ffd8');
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(2, 6, 2, 0.7)';
+  ctx.fillRect(0, 0, VW, RH);
+  centerText(['ПАУЗА', 'Кнопка «ДАЛЬШЕ» — продолжить'], 250, 28, 24, '#ffd23a');
+}
+
+function drawOver() {
+  ctx.fillStyle = 'rgba(20, 2, 2, 0.85)';
+  ctx.fillRect(0, 0, VW, RH);
+  centerText(['КОНЕЦ СМЕНЫ', G.overReason], 170, 28, 26, '#ff5a5a');
+  centerText([
+    'Счёт: ' + G.score + '  Село: ' + G.landed + '  Мимо: ' + G.missed,
+    'Рекорд: ' + G.best,
+    '',
+    'Кнопка «ЗАНОВО» внизу — новая смена',
+  ], 260, 21, 13, '#ffd9d9');
+}
+
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#0b0e0b';
+  ctx.fillRect(0, 0, cw, ch);
+
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+  ctx.fillStyle = '#020602';
+  ctx.fillRect(0, 0, VW, VH);
+
+  drawHUD();
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, HUD_H, VW, RH);
+  ctx.clip();
+  ctx.translate(0, HUD_H);
+
+  drawGrid();
+  drawRunway();
+  for (const p of G.planes) drawPlane(p);
+  drawEffects();
+  drawToasts();
+  if (G.state === 'menu') drawMenu();
+  else if (G.state === 'paused') drawPause();
+  else if (G.state === 'over') drawOver();
+
+  ctx.restore();
+  drawPanel();
+
+  ctx.strokeStyle = '#1d5c33';
+  ctx.strokeRect(0.5, 0.5, VW - 1, VH - 1);
+}
+
+function toVirtual(clientX, clientY) {
+  return { x: (clientX - ox) / scale, y: (clientY - oy) / scale };
+}
+
+function handleTap(clientX, clientY) {
+  const pos = toVirtual(clientX, clientY);
+  mouse = pos;
+
+  if (pos.y >= PANEL_Y) {
+    for (const r of buttonRects()) {
+      if (r.def.enabled() && pos.x >= r.x && pos.x <= r.x + r.w && pos.y >= r.y && pos.y <= r.y + r.h) {
+        r.def.action();
+        return;
+      }
+    }
+    return;
+  }
+
+  if (G.state === 'menu') { start(); return; }
+  if (G.state !== 'playing') return;
+
+  const rp = { x: pos.x, y: pos.y - HUD_H };
+  let hit = null;
+  for (const p of G.planes) {
+    if (Math.hypot(p.x - rp.x, p.y - rp.y) < 20) { hit = p; break; }
+  }
+  if (hit) {
+    G.selected = hit.id;
+    beep(700, 0.04, 'square', 0.03);
+    if (navigator.vibrate) navigator.vibrate(15);
+  } else if (selectedPlane()) {
+    cmdVector(rp.x, rp.y);
+  } else {
+    G.selected = null;
+  }
+}
+
+let lastTouch = 0;
+canvas.addEventListener('touchstart', ev => {
+  ev.preventDefault();
+  lastTouch = Date.now();
+  const t = ev.changedTouches[0];
+  handleTap(t.clientX, t.clientY);
+}, { passive: false });
+
+canvas.addEventListener('touchmove', ev => ev.preventDefault(), { passive: false });
+canvas.addEventListener('contextmenu', ev => ev.preventDefault());
+
+canvas.addEventListener('click', ev => {
+  if (Date.now() - lastTouch < 500) return;
+  handleTap(ev.clientX, ev.clientY);
+});
+
+canvas.addEventListener('mousemove', ev => {
+  mouse = toVirtual(ev.clientX, ev.clientY);
+});
+
+document.addEventListener('touchmove', ev => ev.preventDefault(), { passive: false });
+
+document.addEventListener('keydown', ev => {
+  const k = ev.key.toLowerCase();
+  if (k === ' ') { ev.preventDefault(); if (G.state === 'playing') cmdLand(); return; }
+  if (k === 'enter' && G.state === 'menu') { start(); return; }
+  if (k === 'r') { start(); return; }
+  if (k === 'p') { togglePause(); return; }
+  if (k === 'm') { toggleMute(); return; }
+  if (G.state !== 'playing') return;
+  if (k === 'w' || k === 'arrowup') cmdAlt(1000);
+  else if (k === 's' || k === 'arrowdown') cmdAlt(-1000);
+  else if (k === 'd' || k === 'arrowright') cmdSpd(10);
+  else if (k === 'a' || k === 'arrowleft') cmdSpd(-10);
+  else if (k === 'l') cmdLand();
+  else if (k >= '1' && k <= '9') {
+    const idx = parseInt(k, 10) - 1;
+    if (G.planes[idx]) { G.selected = G.planes[idx].id; beep(700, 0.04, 'square', 0.03); }
+  }
+});
+
+let lastTs = 0;
+function loop(ts) {
+  const dt = Math.min(0.05, (ts - lastTs) / 1000 || 0);
+  lastTs = ts;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
